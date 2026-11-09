@@ -240,6 +240,7 @@ pub fn sidebar(app: &mut App, ui: &mut Ui) {
     nav(ui, glyphs::EXPLORE, APPLE, "New", Page::New, p == Page::New, &mut go_to);
     nav(ui, glyphs::LIBRARY, APPLE, "Library", Page::Library(LibTab::Playlists), matches!(p, Page::Library(_)), &mut go_to);
     nav(ui, glyphs::DOWNLOAD, APPLE, "Downloads", Page::Downloads, p == Page::Downloads, &mut go_to);
+    nav(ui, glyphs::USERS, LUCIDE, "Listen Together", Page::Jam, p == Page::Jam, &mut go_to);
 
     ui.add_space(14.0);
     let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());

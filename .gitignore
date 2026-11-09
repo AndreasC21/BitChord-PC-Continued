@@ -1,4 +1,5 @@
 /target
+tools/party-client-tests/target/
 
 installer/Output/
 .claude/

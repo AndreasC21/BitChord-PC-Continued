@@ -1,72 +1,56 @@
-//! Listen together: the page (start, join, the room), the host sending its playback
-//! to the room, and guests following it. The connection itself is `crate::jam`.
+//! UI and audio reconciliation for the official, server-authoritative party protocol.
+//! Every participant (including the host) follows server state. Inbound audio changes
+//! go straight to AudioCmd, never through the outbound user-action path.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use egui::{Align2, RichText, Sense, Ui, pos2, vec2};
+use egui::Ui;
+use serde_json::{Value, json};
 
-use super::pages::{divider, page_title, section_label, setting_row, settings_card, toggle};
-use super::widgets::{icon_at, pill};
 use super::{Action, App, Page};
 use crate::audio::AudioCmd;
-use crate::jam::{Cmd, Event, Jam, Member, RoomState, Tick};
-use crate::model::Target;
-use crate::theme::{self, icon};
+use crate::jam::protocol::{Member, PartyQueue, PartyTrack, Playback};
+use crate::jam::{Event, Frame, Identity, Jam};
+use crate::model::{Link, Target, Thumb, Track};
 
-/// Guests further than this from the host jump to where the host is.
-const MAX_DRIFT: Duration = Duration::from_millis(350);
-/// The host re-sends its position this often while playing, so drift gets corrected.
-const TICK_EVERY: Duration = Duration::from_secs(15);
-/// Songs before / after the current one sent to guests (liked-songs queues are huge).
-const BEFORE: usize = 20;
-const AFTER: usize = 100;
-/// Songs one guest may have waiting in the queue at once.
-const GUEST_WAITING: usize = 5;
+#[path = "jam/view.rs"]
+mod view;
+
+const MAX_UPCOMING: usize = 25;
+const MAX_DRIFT_MS: u64 = 750;
 
 #[derive(Default)]
 pub struct Session {
     conn: Option<Jam>,
-    /// We started the room (until the server says who the host is).
     created: bool,
     welcomed: bool,
     reconnecting: bool,
+    code: String,
     you: String,
-    host: String,
-    control: bool,
-    /// Guests may add songs.
-    queue: bool,
+    host_only: bool,
     members: Vec<Member>,
-    /// Who added which song (video ID → name), for songs guests added.
-    pub by: HashMap<String, String>,
-    /// Who added which song (video ID → member ID).
-    owner: HashMap<String, String>,
-    /// The code typed on the page.
-    code_input: String,
-    /// The name others see (saved); empty: the account's name.
-    pub name: String,
-    error: Option<String>,
-
-    // host
-    /// Fingerprint of the last state sent, and where playback was then.
-    sent_sig: u64,
-    sent: Option<(Tick, Instant)>,
-    /// Index in our queue of the first song sent (guests' indexes are relative to it).
-    sent_from: usize,
-
-    // guest
-    /// The host's latest position.
-    last: Option<(Tick, Instant)>,
-    /// The song we started for the room, and when we asked for it.
+    max_members: u8,
+    view: view::State,
+    playback: Option<Playback>,
+    queue: PartyQueue,
+    queue_requested: Option<u64>,
+    initial: Option<(Vec<Track>, usize, u64, bool)>,
     loaded: Option<String>,
-    /// The last song reported to YouTube as played, so pauses don't count it twice.
     reported: Option<String>,
     load_started: Option<Instant>,
-    /// How long songs take to start here, so they're opened that far ahead.
     load_ms: u64,
-    /// Steps of the YTM_JAM_SCRIPT dev hook already run.
+    last_sync: Option<Instant>,
+    drift_strikes: u8,
+    finished_seq: Option<u64>,
+    code_input: String,
+    pub name: String,
+    pub server: String,
+    pub device_id: String,
+    error: Option<String>,
+    /// Current-track attribution, used by the existing queue UI.
+    pub by: HashMap<String, String>,
     script_done: usize,
 }
 
@@ -76,12 +60,11 @@ impl Session {
     }
 
     pub fn is_host(&self) -> bool {
-        self.active() && if self.welcomed { self.you == self.host } else { self.created }
+        self.members.iter().any(|m| m.member_id == self.you && m.is_host)
     }
 
-    /// In a room someone else hosts: playback follows the host.
-    pub fn guest(&self) -> bool {
-        self.active() && !self.is_host()
+    fn can_control(&self) -> bool {
+        !self.host_only || self.is_host()
     }
 
     pub fn member_count(&self) -> usize {
@@ -89,670 +72,478 @@ impl Session {
     }
 }
 
-fn my_name(app: &App) -> String {
-    [Some(app.jam.name.clone()), app.account_name.clone()]
-        .into_iter()
-        .flatten()
-        .map(|n| n.trim().to_owned())
-        .find(|n| !n.is_empty())
-        .unwrap_or_else(|| "Guest".to_owned())
+fn to_party(track: &Track) -> PartyTrack {
+    PartyTrack {
+        video_id: track.id.clone(),
+        title: track.title.clone(),
+        artist: track.artist_line(),
+        thumbnail_url: crate::model::pick(&track.thumbs, 300).map(str::to_owned),
+        duration_ms: track.duration.map(|d| d as u64 * 1000),
+        from_autoplay: false,
+    }
 }
 
-/// A new session, keeping what the page holds (the typed code, the name).
-fn fresh(app: &mut App, created: bool) {
-    let code_input = std::mem::take(&mut app.jam.code_input);
-    let name = std::mem::take(&mut app.jam.name);
-    app.jam = Session { created, code_input, name, queue: true, load_ms: 800, ..Default::default() };
+fn from_party(track: &PartyTrack) -> Track {
+    Track {
+        id: track.video_id.clone(),
+        title: track.title.clone(),
+        artists: vec![Link { name: track.artist.clone(), id: None }],
+        album: None,
+        duration: track.duration_ms.map(|d| (d / 1000).min(u32::MAX as u64) as u32),
+        thumbs: track.thumbnail_url.iter().map(|url| Thumb { url: url.clone(), width: 300, height: 300 }).collect(),
+        track_nr: None,
+        plays: None,
+        music_video: false,
+    }
+}
+
+/// Preserve preferences, not membership credentials, when a party ends.
+fn fresh(app: &mut App) {
+    let old = &mut app.jam;
+    let max_members = old.view.capacity;
+    app.jam = Session {
+        name: std::mem::take(&mut old.name),
+        server: std::mem::take(&mut old.server),
+        device_id: std::mem::take(&mut old.device_id),
+        code_input: std::mem::take(&mut old.code_input),
+        max_members,
+        view: std::mem::take(&mut old.view).without_room(),
+        load_ms: 500,
+        ..Default::default()
+    };
 }
 
 pub fn start(app: &mut App) {
-    start_with(app, crate::jam::new_code());
+    enter(app, None);
 }
 
-fn start_with(app: &mut App, code: String) {
-    leave(app);
-    fresh(app, true);
-    app.jam.conn = Some(Jam::start(&app.backend, code, true, my_name(app)));
-    // Guests get the host's exact upload: a song version standing in for a music video
-    // goes back to the video, from the same point.
-    app.play_listed_upload();
-}
-
-pub fn join(app: &mut App, code: &str) {
-    let Some(code) = crate::jam::normalize_code(code) else {
-        app.jam.error = Some("Codes are 6 letters and numbers".into());
+pub fn join(app: &mut App, value: &str) {
+    // Public official links are accepted in the input field too. For self-hosted
+    // parties, set the server explicitly; pasted links never silently change it.
+    let Some(code) = invite_code(&app.jam.server, value) else {
+        app.jam.error = Some("Enter a six-character party code or an official invite link.".into());
         return;
     };
-    if app.jam.conn.as_ref().is_some_and(|c| c.code == code) {
+    if app.jam.active() && app.jam.code == code {
         return;
     }
-    leave(app);
-    fresh(app, false);
-    app.jam.conn = Some(Jam::start(&app.backend, code, false, my_name(app)));
-    app.play_listed_upload();
+    enter(app, Some(code));
 }
 
-/// Leave the room (the host ends it for everyone). Playback carries on locally.
-pub fn leave(app: &mut App) {
-    if let Some(c) = app.jam.conn.take() {
-        if app.jam.is_host() {
-            c.end();
-        }
-        c.leave();
+fn invite_code(server: &str, value: &str) -> Option<String> {
+    let custom = crate::jam::normalize_server(server).ok().and_then(|server| {
+        let url = url::Url::parse(value.trim()).ok()?;
+        let base = format!("{server}/invite/");
+        let candidate = url.as_str().strip_prefix(&base)?.split(['?', '#']).next()?;
+        (candidate.len() == 6 && candidate.chars().all(|c| c.is_ascii_alphanumeric())).then(|| crate::jam::normalize_code(candidate)).flatten()
+    });
+    crate::deeplink::parse(value).or(custom).or_else(|| crate::jam::normalize_code(value))
+}
+
+fn enter(app: &mut App, code: Option<String>) {
+    if !app.logged_in {
+        app.jam.error = Some("Sign in to YouTube Music before joining a party.".into());
+        return;
     }
-    fresh(app, false);
+    let server = match crate::jam::normalize_server(&app.jam.server) {
+        Ok(server) => server,
+        Err(error) => {
+            app.jam.error = Some(error.into());
+            return;
+        }
+    };
+    leave(app);
+    app.jam.server = server.clone();
+    app.jam.created = code.is_none();
+    // Device IDs are persistent but not credentials. No Google session data leaves
+    // the account layer. The official server accepts a client-asserted user ID;
+    // this client uses an installation-scoped ID (not a verified Google identity).
+    if app.jam.device_id.is_empty() {
+        use std::hash::{BuildHasher, Hasher};
+        let mut hash = std::collections::hash_map::RandomState::new().build_hasher();
+        hash.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+        app.jam.device_id = format!("desktop-{:016x}", hash.finish());
+    }
+    let name = [&app.jam.name, app.account_name.as_deref().unwrap_or("")]
+        .into_iter()
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty())
+        .unwrap_or("BitChord desktop")
+        .chars()
+        .scan(0, |bytes, ch| {
+            *bytes += ch.len_utf8();
+            (*bytes <= 80).then_some(ch)
+        })
+        .collect::<String>();
+    let identity = Identity { user_id: app.jam.device_id.clone(), device_id: app.jam.device_id.clone(), display_name: name, avatar_url: app.account_avatar.clone() };
+    if app.jam.created
+        && let Some(index) = app.queue.index
+    {
+        let tracks = app.queue.tracks.iter().skip(index).take(MAX_UPCOMING + 1).cloned().collect();
+        app.jam.initial = Some((tracks, 0, app.audio.status.position().as_millis() as u64, app.playing()));
+    }
+    app.jam.conn = Some(Jam::start_with_capacity(&app.backend, server, code, identity, app.jam.view.capacity));
+    // Disable local-only timing changes without overwriting the saved preferences.
+    app.handoff = false;
+    app.pending_mix = None;
+    app.mix_from = None;
+    app.queue.fill = None;
+    app.play_pending = None;
+    app.set_crossfade();
+    // Cancel old stream resolutions too. Otherwise a late local Play response can
+    // start the wrong song after joining a party that is paused.
+    let position = app.resume_at.unwrap_or_else(|| app.audio.status.position());
+    app.generation += 1;
+    app.audio.status.wanted_gen.store(app.generation, Ordering::Relaxed);
+    app.audio.send(AudioCmd::Stop);
+    app.buffering = false;
+    app.playing_as = None;
+    if app.queue.index.is_some() {
+        app.resume_at = Some(position);
+    }
 }
 
-/// Dev hooks: YTM_JAM_HOST=<code> starts a room with that code, YTM_JAM_JOIN=<code> joins one.
+/// Leaving as host transfers ownership; it does not end the party for mobile users.
+pub fn leave(app: &mut App) {
+    if let Some(conn) = app.jam.conn.take() {
+        conn.leave();
+    }
+    fresh(app);
+    app.set_crossfade();
+}
+
 pub fn dev_hooks(app: &mut App) {
-    if let Some(code) = super::dev_var("YTM_JAM_HOST").and_then(crate::jam::normalize_code) {
+    if super::dev_var("YTM_JAM_HOST").is_some() {
         app.go(Page::Jam);
-        start_with(app, code);
+        start(app);
     } else if let Some(code) = super::dev_var("YTM_JAM_JOIN") {
         app.go(Page::Jam);
         join(app, code);
     }
 }
 
-/// Dev hook: YTM_JAM_SCRIPT="<secs>:<action>,…" presses buttons at those app times, as
-/// whoever this instance is (a guest's go to the host as requests). Actions: skip, prev,
-/// toggle, seek=<secs>, add=<videoId>, control=on|off.
 pub fn dev_script(app: &mut App, ctx: &egui::Context, now: f64) {
     let Some(script) = super::dev_var("YTM_JAM_SCRIPT") else { return };
     for (i, step) in script.split(',').enumerate() {
-        let Some((t, act)) = step.split_once(':') else { continue };
-        let Ok(t) = t.parse::<f64>() else { continue };
+        let Some((time, action)) = step.split_once(':') else { continue };
+        let Ok(time) = time.parse::<f64>() else { continue };
         if i < app.jam.script_done {
             continue;
         }
-        if now < t {
-            // A paused app doesn't redraw on its own.
-            ctx.request_repaint_after(Duration::from_secs_f64(t - now));
+        if now < time {
+            ctx.request_repaint_after(Duration::from_secs_f64(time - now));
             break;
         }
         app.jam.script_done = i + 1;
-        log::info!("jam: script {act}");
-        match act {
+        match action {
             "skip" => app.next(),
             "prev" => app.prev(),
             "toggle" => app.toggle(),
-            "control=on" => set_control(app, true, app.jam.queue),
-            "control=off" => set_control(app, false, app.jam.queue),
-            "queue=on" => set_control(app, app.jam.control, true),
-            "queue=off" => set_control(app, app.jam.control, false),
-            a if a.starts_with("add=") => {
-                let track = crate::model::Track { id: a[4..].to_owned(), title: "Test song".into(), artists: vec![], album: None, duration: None, thumbs: vec![], track_nr: None, plays: None, music_video: false };
-                app.apply(Action::Enqueue(track));
-            }
-            a if a.starts_with("seek=") => {
-                if let Ok(s) = a[5..].parse() {
-                    app.apply(Action::Seek(s));
+            "control=on" => control(app, "setHostOnlyControl", json!({"enabled": false})),
+            "control=off" => control(app, "setHostOnlyControl", json!({"enabled": true})),
+            action if action.starts_with("seek=") => {
+                if let Ok(seconds) = action[5..].parse() {
+                    app.apply(Action::Seek(seconds));
                 }
+            }
+            action if action.starts_with("add=") => {
+                app.apply(Action::Enqueue(from_party(&PartyTrack { video_id: action[4..].into(), title: "Test song".into(), ..Default::default() })));
             }
             _ => {}
         }
     }
 }
 
-/// A link (or a code from another launch) asked to join a room.
 pub fn open_link(app: &mut App, code: String) {
+    // Never auto-join from an external link: show the code and server for confirmation.
     app.go(Page::Jam);
-    join(app, &code);
+    app.jam.code_input = code;
 }
 
-/// Every frame: handle what arrived, then (host) send changes or (guest) catch up.
 pub fn tick(app: &mut App) {
     let Some(conn) = &app.jam.conn else { return };
     let mut events = Vec::new();
-    while let Some(e) = conn.try_recv() {
-        events.push(e);
+    while let Some(event) = conn.try_recv() {
+        events.push(event);
     }
-    for e in events {
-        on_event(app, e);
+    for event in events {
+        on_event(app, event);
     }
-    if !app.jam.welcomed || app.jam.reconnecting {
-        return;
-    }
-    if app.jam.is_host() {
-        host_send(app);
-    } else {
-        guest_follow(app);
-    }
-}
-
-fn on_event(app: &mut App, e: Event) {
-    let s = &mut app.jam;
-    match e {
-        Event::Welcome { you, host, control, queue, members } => {
-            let rejoin = s.welcomed;
-            s.welcomed = true;
-            s.reconnecting = false;
-            s.error = None;
-            s.you = you;
-            s.host = host;
-            s.control = control;
-            s.queue = queue;
-            s.members = members;
-            // Send our state straight away when hosting.
-            s.sent_sig = 0;
-            if !rejoin && s.created {
-                app.toast("Jam started: share the code or link");
-            } else if !rejoin {
-                app.toast("Joined the jam");
-            }
-        }
-        Event::Members { host, members } => {
-            let promoted = s.you != s.host && host == s.you;
-            s.host = host;
-            s.members = members;
-            if promoted {
-                s.sent_sig = 0;
-                app.toast("You're the host now");
-            }
-        }
-        Event::Control { on, queue } => {
-            s.control = on;
-            s.queue = queue;
-        }
-        Event::State(state, at) => {
-            if s.is_host() {
-                return;
-            }
-            apply_state(app, state, at);
-        }
-        Event::Tick(t, at) => {
-            if s.is_host() {
-                return;
-            }
-            app.jam.last = Some((t, at));
-            sync(app);
-        }
-        Event::Req { from, name, cmd } => {
-            log::info!("jam: {name} asks {cmd:?}");
-            host_request(app, from, name, cmd);
-        }
-        Event::Notice(m) => {
-            log::info!("jam: {m}");
-            app.toast(m);
-        }
-        Event::Reconnecting => s.reconnecting = true,
-        Event::Closed(msg) => {
-            let first = !s.welcomed;
-            leave(app);
-            if first {
-                app.jam.error = Some(msg);
-            } else {
-                app.toast(msg);
-            }
-        }
-    }
-}
-
-// ------------------------------------------------------------------------ host
-
-/// The part of the queue the room sees, the playing song's position, and a signature
-/// of what would be sent: it runs every frame, so the state itself is only built
-/// (`host_state`) when the signature changed.
-fn host_tick(app: &App) -> (std::ops::Range<usize>, Tick, u64) {
-    let index = app.queue.index.unwrap_or(0);
-    let from = index.saturating_sub(BEFORE);
-    let to = (index + AFTER).min(app.queue.tracks.len()).max(from);
-    let vid = app.current().map(|t| t.id.clone()).unwrap_or_default();
-    let (pos, playing) = match app.resume_at {
-        Some(at) => (at, false),
-        None => (app.audio.status.position(), app.playing()),
-    };
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    for t in app.queue.tracks.get(from..to).unwrap_or_default() {
-        t.id.hash(&mut h);
-    }
-    (index - from).hash(&mut h);
-    vid.hash(&mut h);
-    playing.hash(&mut h);
-    app.generation.hash(&mut h);
-    (from..to, Tick { vid, pos: pos.as_millis() as u64, playing }, h.finish() | 1)
-}
-
-fn host_state(app: &App, range: std::ops::Range<usize>, tick: &Tick) -> RoomState {
-    let index = app.queue.index.unwrap_or(0) - range.start;
-    let queue = app.queue.tracks.get(range).map(<[_]>::to_vec).unwrap_or_default();
-    let ids: std::collections::HashSet<&str> = queue.iter().map(|t| t.id.as_str()).collect();
-    let pick = |m: &HashMap<String, String>| m.iter().filter(|(id, _)| ids.contains(id.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
-    let (by, owner) = (pick(&app.jam.by), pick(&app.jam.owner));
-    RoomState { queue, index, by, owner, vid: tick.vid.clone(), pos: tick.pos, playing: tick.playing }
-}
-
-fn host_send(app: &mut App) {
-    // A song still loading has no real position yet: send once it plays.
-    if app.buffering {
-        return;
-    }
-    let (range, tick, sig) = host_tick(app);
-    let now = Instant::now();
-    if app.jam.conn.is_none() {
-        return;
-    }
-    let state = (sig != app.jam.sent_sig).then(|| host_state(app, range, &tick));
-    let s = &mut app.jam;
-    let Some(conn) = &s.conn else { return };
-    if let Some(state) = state {
-        log::info!(
-            "jam: sending state ({} songs, {} KB, {} at {} ms, playing {})",
-            state.queue.len(),
-            serde_json::to_vec(&state).map_or(0, |v| v.len() / 1024),
-            state.vid,
-            state.pos,
-            state.playing
-        );
-        conn.send_state(&state);
-        s.sent_sig = sig;
-        s.sent_from = app.queue.index.unwrap_or(0).saturating_sub(BEFORE);
-        s.sent = Some((tick, now));
-        return;
-    }
-    let Some((sent, at)) = &s.sent else { return };
-    // A seek: the position moved away from where it should be.
-    let expected = sent.position_at(*at).as_millis() as i64;
-    let jumped = (expected - tick.pos as i64).abs() > 1500;
-    if jumped || (tick.playing && at.elapsed() >= TICK_EVERY) {
-        log::debug!("jam: sending tick at {} ms", tick.pos);
-        conn.send_tick(&tick);
-        s.sent = Some((tick, now));
-    }
-}
-
-/// Songs `member` added that haven't played yet.
-fn waiting(app: &App, member: &str) -> usize {
-    let start = app.queue.index.map_or(0, |i| i + 1);
-    app.queue.tracks.get(start..).unwrap_or_default().iter().filter(|t| app.jam.owner.get(&t.id).is_some_and(|m| m == member)).count()
-}
-
-fn host_request(app: &mut App, from: String, name: String, cmd: Cmd) {
-    if !app.jam.is_host() {
-        return;
-    }
-    if let Cmd::Add { track } | Cmd::Next { track } = &cmd {
-        // Their app checks this too; two adds can cross the latest state, though.
-        if waiting(app, &from) >= GUEST_WAITING && from != app.jam.you {
-            log::info!("jam: {name} already has {GUEST_WAITING} songs waiting");
-            return;
-        }
-        app.jam.owner.insert(track.id.clone(), from);
-    }
-    match cmd {
-        Cmd::Add { track } | Cmd::Next { track } if track.id.is_empty() => {}
-        Cmd::Add { track } => {
-            app.toast(format!("{name} added \"{}\"", track.title));
-            app.jam.by.insert(track.id.clone(), name);
-            let Some(i) = app.queue.index else {
-                app.queue.tracks.push(track);
-                app.queue.index = Some(app.queue.tracks.len() - 1);
-                app.play_current();
-                return;
-            };
-            // After the current song and the other songs people added, ahead of autoplay.
-            let mut at = i + 1;
-            while app.queue.tracks.get(at).is_some_and(|t| app.jam.by.contains_key(&t.id)) {
-                at += 1;
-            }
-            app.queue.tracks.insert(at.min(app.queue.tracks.len()), track);
-            app.prefetch_next();
-        }
-        Cmd::Next { track } => {
-            app.toast(format!("{name} queued \"{}\" next", track.title));
-            app.jam.by.insert(track.id.clone(), name);
-            let at = app.queue.index.map_or(0, |i| i + 1).min(app.queue.tracks.len());
-            app.queue.tracks.insert(at, track);
-            if app.queue.index.is_none() {
-                app.queue.index = Some(0);
-                app.play_current();
-            } else {
-                app.prefetch_next();
-            }
-        }
-        // The server only passes these on while guests may control playback.
-        Cmd::Toggle => app.toggle(),
-        Cmd::Skip => app.next(),
-        Cmd::Prev => app.prev(),
-        Cmd::Seek { pos } => app.apply(Action::Seek(pos as f32 / 1000.0)),
-        Cmd::Jump { index } => {
-            let i = app.jam.sent_from + index;
-            if i < app.queue.tracks.len() {
-                app.queue.index = Some(i);
-                app.play_current();
-            }
-        }
-    }
-}
-
-/// Host: what guests may do (control playback, add songs).
-fn set_control(app: &mut App, on: bool, queue: bool) {
-    app.jam.control = on;
-    app.jam.queue = queue;
-    if let Some(c) = &app.jam.conn {
-        c.set_control(on, queue);
-    }
-}
-
-// ----------------------------------------------------------------------- guest
-
-fn apply_state(app: &mut App, state: RoomState, at: Instant) {
-    let tick = Tick { vid: state.vid.clone(), pos: state.pos, playing: state.playing };
-    app.jam.by = state.by;
-    app.jam.owner = state.owner;
-    app.queue_source = None;
-    app.queue.fill = None;
-    app.play_pending = None;
-    if state.queue.is_empty() {
-        app.queue.tracks.clear();
-        app.queue.index = None;
-        app.jam.loaded = None;
-        app.audio.send(AudioCmd::Stop);
-        app.jam.last = None;
-        return;
-    }
-    app.queue.index = Some(state.index.min(state.queue.len() - 1));
-    app.queue.tracks = state.queue;
-    app.jam.last = Some((tick, at));
-    sync(app);
-}
-
-/// Get playback to where the host is.
-fn sync(app: &mut App) {
-    let Some((tick, at)) = app.jam.last.clone() else { return };
-    if tick.vid.is_empty() {
-        return;
-    }
-    // A tick can name a song before its state arrives: wait for the state then.
-    if app.current_id() != Some(tick.vid.as_str()) {
-        match app.queue.tracks.iter().position(|t| t.id == tick.vid) {
-            Some(i) => app.queue.index = Some(i),
-            None => return,
-        }
-    }
-    let target = tick.position_at(at);
-    if app.jam.loaded.as_deref() != Some(tick.vid.as_str()) || app.resume_at.is_some() {
-        if tick.playing {
-            // Opened a little ahead: by the time it starts, the host is there.
-            let ahead = Duration::from_millis(app.jam.load_ms);
-            // Joining a song counts as a play; catching up on the same one doesn't.
-            let report = app.jam.reported.as_deref() != Some(tick.vid.as_str());
-            app.jam.reported = Some(tick.vid.clone());
-            app.jam.loaded = Some(tick.vid.clone());
-            app.jam.load_started = Some(Instant::now());
-            app.play_current_at(target + ahead, report);
-        } else if app.jam.loaded.as_deref() != Some(tick.vid.as_str()) || app.resume_at != Some(target) {
-            // Paused: show the song at the host's position without loading it.
-            app.audio.send(AudioCmd::Stop);
-            app.jam.loaded = None;
-            app.resume_at = Some(target);
-            app.audio.status.position_ms.store(target.as_millis() as u64, Ordering::Relaxed);
-            app.audio.status.duration_ms.store(app.current().and_then(|t| t.duration).map_or(0, |d| d as u64 * 1000), Ordering::Relaxed);
-            app.request_art();
-        }
-        return;
-    }
-    if app.buffering {
-        return;
-    }
-    if tick.playing != app.playing() {
-        app.audio.send(if tick.playing { AudioCmd::Resume } else { AudioCmd::Pause });
-    }
-    let pos = app.audio.status.position_smooth();
-    let off = pos.as_millis() as i64 - target.as_millis() as i64;
-    log::debug!("jam: {off:+} ms from the host (at {} ms, host {} ms)", pos.as_millis(), target.as_millis());
-    if off.unsigned_abs() > MAX_DRIFT.as_millis() as u64 {
-        log::info!("jam: {off:+} ms from the host, seeking");
-        app.audio.send(if tick.playing { AudioCmd::SeekLive { pos: target, at: Instant::now() } } else { AudioCmd::Seek(target) });
-    }
-}
-
-fn guest_follow(app: &mut App) {
-    // A song we started for the room just began: learn how long that took, and
-    // line up with the host.
-    if let Some(t) = app.jam.load_started
-        && !app.buffering
-        && app.playing()
-    {
-        app.jam.load_started = None;
-        let took = t.elapsed().as_millis() as u64;
-        app.jam.load_ms = ((app.jam.load_ms + took.min(8000)) / 2).max(200);
-        if let Some((tick, at)) = &app.jam.last {
-            let off = app.audio.status.position().as_millis() as i64 - tick.position_at(*at).as_millis() as i64;
-            log::info!("jam: song started after {took} ms, {off:+} ms from the host");
-        }
+    if app.jam.welcomed && !app.jam.reconnecting {
         sync(app);
     }
 }
 
-/// Ask the host to do something (as a guest).
-pub fn request(app: &mut App, cmd: Cmd) {
-    if cmd.is_control() && !app.jam.control {
-        app.toast("Only the host can control playback");
-        return;
-    }
-    if !cmd.is_control() && !app.jam.queue {
-        app.toast("The host turned off adding songs");
-        return;
-    }
-    if !cmd.is_control() && waiting(app, &app.jam.you) >= GUEST_WAITING {
-        log::info!("jam: {GUEST_WAITING} songs already waiting");
-        app.toast(format!("You have {GUEST_WAITING} songs waiting. Add more once one plays"));
-        return;
-    }
-    match &cmd {
-        Cmd::Add { .. } => app.toast("Added to the jam"),
-        Cmd::Next { .. } => app.toast("Playing next in the jam"),
-        _ => {}
-    }
-    if let Some(c) = &app.jam.conn {
-        c.request(cmd);
+fn on_event(app: &mut App, event: Event) {
+    match event {
+        Event::Joined(membership) => {
+            app.jam.code = membership.code;
+            app.jam.you = membership.you.member_id;
+            app.jam.members = membership.party.members;
+            app.jam.max_members = membership.party.max_members;
+        }
+        Event::Frame(Frame::Welcome { you, party, .. }) => {
+            let first = !app.jam.welcomed;
+            app.jam.welcomed = true;
+            app.jam.reconnecting = false;
+            app.jam.you = you.member_id;
+            app.jam.host_only = party.host_only_control;
+            app.jam.members = party.members;
+            app.jam.max_members = party.max_members;
+            app.jam.queue = party.queue;
+            app.jam.queue_requested = None;
+            app.jam.playback = Some(party.playback);
+            // Seed a newly created room exactly once; a reconnect must never replace
+            // another device's changes with a desktop queue snapshot.
+            if first && let Some((tracks, index, position, playing)) = app.jam.initial.take() {
+                publish_queue(app, &tracks, index, position, playing);
+                app.jam.playback = None;
+            }
+            if first {
+                app.toast(if app.jam.created { "Party created: share the code with mobile or PC" } else { "Joined the party" });
+            }
+        }
+        Event::Frame(Frame::State { playback }) => {
+            if app.jam.playback.as_ref().is_none_or(|old| playback.seq > old.seq) {
+                app.jam.playback = Some(playback);
+            }
+        }
+        Event::Frame(Frame::Queue { queue }) => {
+            if queue.seq >= app.jam.queue.seq {
+                app.jam.queue = queue;
+                app.jam.queue_requested = None;
+            }
+        }
+        Event::Frame(Frame::Members { members, max_members, host_only_control }) => {
+            app.jam.members = members;
+            app.jam.max_members = max_members;
+            app.jam.host_only = host_only_control;
+        }
+        Event::Frame(Frame::Activity { entry }) => app.jam.view.push_activity(entry),
+        Event::Frame(Frame::Error { error }) => {
+            app.toast(crate::jam::protocol::error_message(&error, 0));
+            // The rejected local action did not change playback; ask for truth again.
+            if let Some(conn) = &app.jam.conn {
+                conn.send(json!({"type": "sync"}));
+            }
+        }
+        Event::Frame(_) => {}
+        Event::Reconnecting => app.jam.reconnecting = true,
+        Event::Closed(message) => {
+            leave(app);
+            app.jam.error = Some(message.clone());
+            app.toast(message);
+        }
     }
 }
 
-/// A guest's action: things that would change the room's playback go to the host
-/// instead. Returns the action if it should run locally.
-pub fn guest_action(app: &mut App, a: Action) -> Option<Action> {
-    match a {
-        Action::Play(tracks, i) => {
-            if let Some(t) = tracks.into_iter().nth(i) {
-                if app.current_id() == Some(t.id.as_str()) {
-                    request(app, Cmd::Toggle);
-                } else {
-                    request(app, Cmd::Add { track: t });
-                }
+fn sync(app: &mut App) {
+    let Some(playback) = app.jam.playback.clone() else { return };
+    let Some(conn) = &app.jam.conn else { return };
+    if playback.queue_seq != app.jam.queue.seq {
+        if app.jam.queue_requested != Some(playback.queue_seq) {
+            conn.send(json!({"type": "syncQueue"}));
+            app.jam.queue_requested = Some(playback.queue_seq);
+        }
+        return;
+    }
+    let now = conn.clock.server_ms();
+    let clock_ready = conn.clock.ready();
+    let target = Duration::from_millis(if clock_ready { playback.position_at(now) } else { playback.effective_position_ms });
+    let Some(track) = &playback.track else {
+        if app.jam.loaded.is_some() || app.queue.index.is_some() {
+            // Invalidate any old stream resolution before clearing local playback.
+            app.generation += 1;
+            app.audio.status.wanted_gen.store(app.generation, Ordering::Relaxed);
+            app.audio.send(AudioCmd::Stop);
+            app.buffering = false;
+            app.resume_at = None;
+            app.queue.tracks.clear();
+            app.queue.index = None;
+            app.jam.loaded = None;
+        }
+        return;
+    };
+    // Prefer the authoritative index, not the first matching ID: queues may repeat songs.
+    let index = usize::try_from(playback.queue_index).ok().filter(|i| app.jam.queue.items.get(*i).is_some_and(|t| t.video_id == track.video_id));
+    let index = index.or_else(|| app.jam.queue.items.iter().position(|t| t.video_id == track.video_id));
+    app.queue.tracks = app.jam.queue.items.iter().map(from_party).collect();
+    let index = index.unwrap_or_else(|| {
+        app.queue.tracks.push(from_party(track));
+        app.queue.tracks.len() - 1
+    });
+    app.queue.index = Some(index);
+    app.queue.fill = None;
+    app.queue_source = None;
+    app.jam.by.clear();
+    if let Some(name) = &playback.started_by_name {
+        app.jam.by.insert(track.video_id.clone(), name.clone());
+    }
+    if app.jam.finished_seq == Some(playback.seq) {
+        return;
+    }
+    let lead = if clock_ready { playback.lead_ms(now) } else { 0 };
+    // A seed from welcome is only a rough estimate. Do not start before the first
+    // actual ping/pong sample, which could put this device ahead of a future anchor.
+    let should_play = clock_ready && playback.is_playing && lead == 0;
+    if app.jam.loaded.as_deref() != Some(track.video_id.as_str()) || app.resume_at.is_some() {
+        if should_play {
+            let report = app.jam.reported.as_deref() != Some(track.video_id.as_str());
+            app.jam.reported = Some(track.video_id.clone());
+            app.jam.loaded = Some(track.video_id.clone());
+            app.jam.load_started = Some(Instant::now());
+            app.play_current_at(target + Duration::from_millis(app.jam.load_ms), report);
+        } else if app.resume_at != Some(target) || app.jam.loaded.as_deref() != Some(track.video_id.as_str()) {
+            app.generation += 1;
+            app.audio.status.wanted_gen.store(app.generation, Ordering::Relaxed);
+            app.audio.send(AudioCmd::Stop);
+            app.jam.loaded = Some(track.video_id.clone());
+            app.jam.load_started = None;
+            app.playing_as = None;
+            app.resume_at = Some(target);
+            app.buffering = false;
+            app.audio.status.position_ms.store(target.as_millis() as u64, Ordering::Relaxed);
+            app.audio.status.duration_ms.store(track.duration_ms.unwrap_or(0), Ordering::Relaxed);
+            app.request_art();
+            let shown = from_party(track);
+            app.show_in_media(&shown);
+            app.refresh_lyrics(shown);
+        }
+        return;
+    }
+    if app.buffering {
+        return;
+    }
+    if let Some(started) = app.jam.load_started.take() {
+        app.jam.load_ms = ((app.jam.load_ms + started.elapsed().as_millis().min(8_000) as u64) / 2).max(100);
+        app.jam.last_sync = None;
+    }
+    if app.playing() != should_play {
+        app.audio.send(if should_play { AudioCmd::Resume } else { AudioCmd::Pause });
+    }
+    if !clock_ready || app.jam.last_sync.is_some_and(|last| last.elapsed() < Duration::from_secs(2)) {
+        return;
+    }
+    let drift = app.audio.status.position_smooth().as_millis().abs_diff(target.as_millis());
+    app.jam.drift_strikes = if drift > MAX_DRIFT_MS as u128 { app.jam.drift_strikes.saturating_add(1) } else { 0 };
+    if app.jam.drift_strikes >= 3 {
+        app.audio.send(if should_play { AudioCmd::SeekLive { pos: target, at: Instant::now() } } else { AudioCmd::Seek(target) });
+        app.jam.last_sync = Some(Instant::now());
+        app.jam.drift_strikes = 0;
+    }
+}
+
+pub fn control(app: &mut App, action: &str, body: Value) {
+    if !app.jam.welcomed || app.jam.reconnecting {
+        app.toast("Wait for the party connection before changing playback");
+        return;
+    }
+    if !app.jam.can_control() && action != "setHostOnlyControl" {
+        app.toast("Only the host can control this party");
+        return;
+    }
+    if serde_json::to_vec(&body).map_or(true, |bytes| bytes.len() > 15_000) {
+        app.toast("This track's metadata is too large for the party server");
+        return;
+    }
+    if let Some(conn) = &app.jam.conn {
+        conn.control(action, body);
+    }
+}
+
+pub fn toggle_playback(app: &mut App) {
+    let playing = app.jam.playback.as_ref().is_some_and(|p| p.is_playing);
+    set_playing(app, !playing);
+}
+
+pub fn set_playing(app: &mut App, playing: bool) {
+    control(app, if playing { "play" } else { "pause" }, json!({}));
+}
+
+/// Only the host advances on decoder completion. A guest's shorter alternate source
+/// or an unplayable local stream must never skip the song on everybody else's device.
+pub fn finished(app: &mut App) {
+    app.jam.finished_seq = app.jam.playback.as_ref().map(|p| p.seq);
+    if app.jam.is_host() && app.jam.can_control() {
+        control(app, "next", json!({}));
+    }
+}
+
+pub fn playback_failed(app: &mut App) {
+    app.jam.finished_seq = app.jam.playback.as_ref().map(|p| p.seq);
+    app.jam.loaded = None;
+    app.jam.load_started = None;
+}
+
+fn publish_queue(app: &mut App, tracks: &[Track], index: usize, position: u64, playing: bool) {
+    let Some(track) = tracks.get(index) else { return };
+    // Bound both frames well below the official server's 16 KiB frame limit.
+    let mut queue = Vec::new();
+    for track in tracks.iter().skip(index).take(MAX_UPCOMING + 1) {
+        let track = to_party(track);
+        let size = serde_json::to_vec(&track).map_or(16_384, |v| v.len());
+        let used: usize = queue.iter().map(|t| serde_json::to_vec(t).map_or(16_384, |v| v.len())).sum();
+        if used + size > 12_000 {
+            break;
+        }
+        queue.push(track);
+    }
+    if queue.is_empty() {
+        app.toast("This track's metadata is too large to share");
+        return;
+    }
+    control(app, "setQueue", json!({"queue": queue, "queueIndex": 0}));
+    control(app, "setTrack", json!({"track": to_party(track), "queueIndex": 0, "positionMs": position, "isPlaying": playing}));
+}
+
+/// Intercept all participants' shared actions, not just guests'. The server echoes
+/// each accepted command back to its sender as well as to the other devices.
+pub fn party_action(app: &mut App, action: Action) -> Option<Action> {
+    match action {
+        Action::Play(tracks, index) => {
+            if tracks.get(index).is_some_and(|t| app.current_id() == Some(t.id.as_str())) {
+                toggle_playback(app);
+            } else {
+                publish_queue(app, &tracks, index, 0, true);
             }
         }
-        Action::Open(Target::Song(t)) | Action::Radio(t) | Action::Enqueue(t) => request(app, Cmd::Add { track: t }),
-        Action::PlayNext(t) => request(app, Cmd::Next { track: t }),
-        Action::PlayCollection(..) => app.toast("In a jam, add songs one at a time"),
-        Action::QueueJump(i) => request(app, Cmd::Jump { index: i }),
-        Action::QueueRemove(_) => app.toast("Only the host can remove songs"),
-        Action::Seek(secs) => request(app, Cmd::Seek { pos: (secs.max(0.0) * 1000.0) as u64 }),
-        Action::TogglePlay => request(app, Cmd::Toggle),
-        a => return Some(a),
+        Action::Open(Target::Song(track)) | Action::Radio(track) => control(app, "setTrack", json!({"track": to_party(&track), "positionMs": 0, "isPlaying": true})),
+        Action::Enqueue(track) => control(app, "queueAdd", json!({"tracks": [to_party(&track)], "playNext": false})),
+        Action::PlayNext(track) => control(app, "queueAdd", json!({"tracks": [to_party(&track)], "playNext": true})),
+        Action::QueueJump(index) => {
+            if let Some(track) = app.jam.queue.items.get(index).cloned() {
+                control(app, "setTrack", json!({"track": track, "queueIndex": index, "positionMs": 0, "isPlaying": true}));
+            }
+        }
+        Action::QueueRemove(index) => control(app, "queueRemove", json!({"index": index})),
+        Action::Seek(seconds) => control(app, "seek", json!({"positionMs": (seconds.max(0.0) as f64 * 1000.0) as u64})),
+        Action::TogglePlay => toggle_playback(app),
+        Action::PlayCollection(..) => app.toast("In a party, open the playlist and select its songs to share"),
+        action => return Some(action),
     }
     None
 }
 
-// ------------------------------------------------------------------------ page
-
 pub fn page(app: &mut App, ui: &mut Ui) {
-    let avail = ui.available_width();
-    let w = avail.min(720.0);
-    ui.horizontal(|ui| {
-        ui.add_space(((avail - w) / 2.0).max(0.0));
-        ui.vertical(|ui| {
-            ui.set_width(w);
-            page_title(ui, "Listen together");
-            if app.jam.active() {
-                room(app, ui);
-            } else {
-                lobby(app, ui);
-            }
-        });
-    });
+    view::page(app, ui);
 }
 
-fn dim(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).font(theme::regular(13.5)).color(theme::text_dim()));
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn lobby(app: &mut App, ui: &mut Ui) {
-    dim(ui, "Start a jam and friends hear what you play, at the same moment. Everyone listens on their own BitChord, and anyone can add songs.");
-    section_label(ui, "Start a jam", None);
-    settings_card(ui, |ui| {
-        let hint = app.account_name.clone().unwrap_or_else(|| "Guest".to_owned());
-        setting_row(ui, "Your name", Some("What others in the jam see."), |ui| {
-            let (rect, _) = ui.allocate_exact_size(vec2(200.0, 36.0), Sense::hover());
-            ui.painter().rect_filled(rect, 10.0, theme::glass(0.08));
-            let inner = rect.shrink2(vec2(12.0, 4.0));
-            ui.put(
-                inner,
-                egui::TextEdit::singleline(&mut app.jam.name)
-                    .hint_text(RichText::new(hint).color(theme::text_faint()))
-                    .font(theme::regular(14.0))
-                    .char_limit(32)
-                    .frame(egui::Frame::NONE)
-                    .align(egui::Align2::LEFT_CENTER)
-                    .desired_width(inner.width()),
-            );
-        });
-        divider(ui);
-        setting_row(ui, "Host a jam", Some("You get a code and a link to share. You control playback."), |ui| {
-            if pill(ui, "Start", Some(icon::USERS), true).clicked() {
-                start(app);
-            }
-        });
-    });
-    section_label(ui, "Join a jam", None);
-    settings_card(ui, |ui| {
-        ui.add_space(12.0);
-        dim(ui, "Type the code from the host, or open the link they shared.");
-        ui.add_space(10.0);
-        let mut join_now = false;
-        // Button on the right edge, the field filling the rest, both one height.
-        ui.allocate_ui_with_layout(vec2(ui.available_width(), 42.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            join_now |= pill(ui, "Join", None, true).clicked();
-            ui.add_space(10.0);
-            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 42.0), Sense::hover());
-            ui.painter().rect_filled(rect, 10.0, theme::glass(0.08));
-            let inner = rect.shrink2(vec2(14.0, 4.0));
-            let edit = ui.put(
-                inner,
-                egui::TextEdit::singleline(&mut app.jam.code_input)
-                    .hint_text(RichText::new("ABC234").color(theme::text_faint()))
-                    .font(theme::semibold(16.0))
-                    .char_limit(8)
-                    .frame(egui::Frame::NONE)
-                    .align(egui::Align2::LEFT_CENTER)
-                    .desired_width(inner.width()),
-            );
-            if edit.changed() {
-                app.jam.error = None;
-            }
-            join_now |= edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        });
-        if join_now {
-            let code = app.jam.code_input.clone();
-            join(app, &code);
-        }
-        if let Some(e) = &app.jam.error {
-            ui.add_space(8.0);
-            ui.label(RichText::new(e).font(theme::regular(13.0)).color(theme::RED));
-        }
-        ui.add_space(14.0);
-    });
-}
-
-fn room(app: &mut App, ui: &mut Ui) {
-    let code = app.jam.conn.as_ref().map(|c| c.code.clone()).unwrap_or_default();
-    let host = app.jam.is_host();
-    let status = if !app.jam.welcomed {
-        Some("Connecting…")
-    } else if app.jam.reconnecting {
-        Some("Connection lost, reconnecting…")
-    } else {
-        None
-    };
-    settings_card(ui, |ui| {
-        ui.add_space(16.0);
-        dim(ui, if host { "Share this code or link with friends" } else { "You're in the jam" });
-        ui.add_space(6.0);
-        let spaced: String = code.chars().map(|c| c.to_string()).collect::<Vec<_>>().join(" ");
-        ui.label(RichText::new(spaced).font(theme::bold(40.0)).color(theme::text()));
-        if let Some(s) = status {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                dim(ui, s);
-            });
-        }
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            if pill(ui, "Copy link", Some(icon::LINK), true).clicked() {
-                app.share_pending = Some(crate::jam::share_link(&code));
-                app.toast("Link copied");
-            }
-            ui.add_space(8.0);
-            if pill(ui, "Copy code", Some(icon::COPY), false).clicked() {
-                app.share_pending = Some(code.clone());
-                app.toast("Code copied");
-            }
-        });
-        ui.add_space(16.0);
-    });
-
-    section_label(ui, "Playback", None);
-    settings_card(ui, |ui| {
-        if host {
-            let (mut queue, mut on) = (app.jam.queue, app.jam.control);
-            setting_row(ui, "Guests can add songs", Some("Songs they play go into the queue, right after the current one."), |ui| {
-                if toggle(ui, &mut queue, "Guests can add songs").changed() {
-                    set_control(app, on, queue);
-                }
-            });
-            divider(ui);
-            setting_row(ui, "Guests can control playback", Some("Play and pause, skip, go back, seek, and jump to a song in the queue."), |ui| {
-                if toggle(ui, &mut on, "Guests can control playback").changed() {
-                    set_control(app, on, queue);
-                }
-            });
-        } else {
-            let desc = match (app.jam.queue, app.jam.control) {
-                (true, true) => "You can add songs and control playback.",
-                (true, false) => "Songs you play are added to the queue. The host controls playback.",
-                (false, true) => "You can control playback. The host turned off adding songs.",
-                (false, false) => "The host controls the queue and playback.",
-            };
-            setting_row(ui, "Following the host", Some(desc), |_| {});
-        }
-        divider(ui);
-        let (title, desc, label) = if host {
-            ("End the jam", "Everyone leaves; your music keeps playing.", "End jam")
-        } else {
-            ("Leave the jam", "The music keeps playing here, on your own.", "Leave")
+    #[test]
+    fn track_conversion_preserves_video_and_duration_units() {
+        let wire = PartyTrack {
+            video_id: "video".into(),
+            title: "Song".into(),
+            artist: "Artist".into(),
+            duration_ms: Some(123_000),
+            thumbnail_url: Some("https://example.com/art.jpg".into()),
+            ..Default::default()
         };
-        setting_row(ui, title, Some(desc), |ui| {
-            if pill(ui, label, Some(icon::LOG_OUT), false).clicked() {
-                leave(app);
-            }
-        });
-    });
-
-    let n = app.jam.members.len();
-    section_label(ui, "People", Some(&format!("{n} listening")));
-    settings_card(ui, |ui| {
-        ui.add_space(6.0);
-        for m in &app.jam.members {
-            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
-            let is_host = m.id == app.jam.host;
-            icon_at(ui, pos2(rect.left() + 12.0, rect.center().y), if is_host { icon::CROWN } else { icon::HEADPHONES }, 17.0, if is_host { app.accent } else { theme::text_dim() });
-            let you = if m.id == app.jam.you { " (you)" } else { "" };
-            ui.painter().text(pos2(rect.left() + 34.0, rect.center().y), Align2::LEFT_CENTER, format!("{}{you}", m.name), theme::semibold(14.5), theme::text());
-            if is_host {
-                ui.painter().text(pos2(rect.right() - 4.0, rect.center().y), Align2::RIGHT_CENTER, "Host", theme::regular(12.5), theme::text_dim());
-            }
-        }
-        ui.add_space(6.0);
-    });
+        let track = from_party(&wire);
+        assert_eq!(track.duration, Some(123));
+        assert_eq!(to_party(&track), wire);
+    }
 }

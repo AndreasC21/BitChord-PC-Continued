@@ -278,6 +278,7 @@ impl App {
         self.audio.status.position_ms.store(at.as_millis() as u64, Ordering::Relaxed);
         self.resume_at = Some(at);
         self.buffering = false;
+        if self.jam.active() { jam::playback_failed(self); }
         let title = self.current().map(|t| t.title.clone()).unwrap_or_default();
         self.toast(format!("Lost the connection while playing \"{title}\". Press play to pick up where it stopped."));
     }
@@ -359,7 +360,7 @@ impl App {
     /// Keep the queue topped up so autoplay never stalls at the end; a playlist still
     /// coming in goes first.
     pub(super) fn top_up(&mut self) {
-        if self.autoplay && !self.radio_pending && !self.jam.guest() && self.queue.fill.is_none() && self.queue.at_end()
+        if self.autoplay && !self.radio_pending && !self.jam.active() && self.queue.fill.is_none() && self.queue.at_end()
             && let Some(t) = self.current().cloned()
         {
             self.radio_pending = true;
@@ -369,8 +370,8 @@ impl App {
 
     pub(crate) fn set_crossfade(&self) {
         // Automix is a crossfade with its own shape, so it needs the length too.
-        self.audio.set_automix(self.automix);
-        self.audio.set_crossfade(if self.crossfade || self.automix { self.crossfade_secs } else { 0 });
+        self.audio.set_automix(self.automix && !self.jam.active());
+        self.audio.set_crossfade(if !self.jam.active() && (self.crossfade || self.automix) { self.crossfade_secs } else { 0 });
     }
 
     /// Ask SponsorBlock about the playing song, when that's switched on.
@@ -384,9 +385,9 @@ impl App {
     }
 
     /// Jump over a SponsorBlock segment once playback is inside it; one that runs to the
-    /// end finishes the song. A guest in a jam follows the host, who does the skipping.
+    /// end finishes the song. Party playback never skips segments independently.
     pub(super) fn skip_segments(&mut self, ctx: &egui::Context, now: f64) {
-        if !self.sponsorblock || self.jam.guest() || self.resume_at.is_some() || self.buffering || !self.playing() {
+        if !self.sponsorblock || self.jam.active() || self.resume_at.is_some() || self.buffering || !self.playing() {
             return;
         }
         let Some((id, segs)) = &self.segments else { return };
@@ -427,8 +428,8 @@ impl App {
     }
 
     pub(super) fn next(&mut self) {
-        if self.jam.guest() {
-            return jam::request(self, crate::jam::Cmd::Skip);
+        if self.jam.active() {
+            return jam::control(self, "next", serde_json::json!({}));
         }
         if !self.queue.advance() {
             return;
@@ -437,8 +438,8 @@ impl App {
     }
 
     pub(super) fn prev(&mut self) {
-        if self.jam.guest() {
-            return jam::request(self, crate::jam::Cmd::Prev);
+        if self.jam.active() {
+            return jam::control(self, "previous", serde_json::json!({}));
         }
         if self.audio.status.position() > Duration::from_secs(3) {
             self.seek_to(Duration::ZERO);
@@ -450,6 +451,9 @@ impl App {
     }
 
     pub(super) fn seek_to(&mut self, at: Duration) {
+        if self.jam.active() {
+            return jam::control(self, "seek", serde_json::json!({"positionMs": at.as_millis() as u64}));
+        }
         if self.resume_at.is_some() {
             // Restored but not loaded yet (nothing for the player to seek): move the start point instead.
             self.resume_at = Some(at);
@@ -463,8 +467,8 @@ impl App {
         if self.queue.index.is_none() {
             return;
         }
-        if self.jam.guest() {
-            return jam::request(self, crate::jam::Cmd::Toggle);
+        if self.jam.active() {
+            return jam::toggle_playback(self);
         }
         if let Some(at) = self.resume_at {
             // Last session's song, already counted when it started then (unless it was
@@ -479,8 +483,8 @@ impl App {
     }
 
     pub(super) fn shuffle_upcoming(&mut self) {
-        if self.jam.guest() {
-            return self.toast("Only the host can shuffle the jam");
+        if self.jam.active() {
+            return self.toast("Shuffle is unavailable while following a party queue");
         }
         if self.queue.shuffle_upcoming() {
             self.toast("Shuffled up next");

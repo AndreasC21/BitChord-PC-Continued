@@ -815,6 +815,10 @@ impl App {
             app.np_open = true;
         }
         app.jam.name = get("jam_name").unwrap_or_default();
+        app.jam.server = get("party_server").filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("BITCHORD_PARTY_SERVER").ok())
+            .unwrap_or_else(|| crate::jam::DEFAULT_SERVER.to_owned());
+        app.jam.device_id = get("party_device_id").unwrap_or_default();
         // Last launch's name, picture and playlists, so they show at once; the account
         // menu and the library replace them when they arrive.
         if app.logged_in
@@ -1124,6 +1128,10 @@ impl eframe::App for App {
             self.apply(a);
         }
         jam::tick(self);
+        if self.jam.active() {
+            // Scheduled server anchors and drift correction must run while idle too.
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
         jam::dev_script(self, ctx, now);
         if self.page_changed < 0.0 {
             self.page_changed = now;
@@ -1385,6 +1393,8 @@ impl eframe::App for App {
         storage.set_string("autoplay", b(self.autoplay));
         storage.set_string("recent_searches", serde_json::to_string(&self.recent_searches).unwrap_or_default());
         storage.set_string("jam_name", self.jam.name.clone());
+        storage.set_string("party_server", self.jam.server.clone());
+        storage.set_string("party_device_id", self.jam.device_id.clone());
         let cache = self.logged_in.then(|| AccountCache {
             name: self.account_name.clone(),
             avatar: self.account_avatar.clone(),
@@ -1468,6 +1478,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        jam::leave(self);
         if let (Some(bg), Some(gl)) = (&self.bg, gl) {
             bg.destroy(gl);
         }

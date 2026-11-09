@@ -1,0 +1,54 @@
+name: Native party client
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'Cargo.*'
+      - 'tools/party-client-tests/**'
+      - '.github/workflows/party-client.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'Cargo.*'
+      - 'tools/party-client-tests/**'
+      - '.github/workflows/party-client.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+        with:
+          repository: kushagrasinghx/BitChord
+          # Pin the official backend used during development for reproducible tests.
+          ref: acf219a7e4a7f52f026d4336d5c7ac5cf7bfafcc
+          path: upstream-reference
+          sparse-checkout: backend
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: upstream-reference/backend/go.mod
+          cache-dependency-path: upstream-reference/backend/go.sum
+      - name: Build the official backend
+        working-directory: upstream-reference/backend
+        run: go build -o "$RUNNER_TEMP/bitchord-jam" .
+      - name: Unit and official-backend integration tests
+        run: BITCHORD_TEST_BACKEND="$RUNNER_TEMP/bitchord-jam" cargo test --manifest-path tools/party-client-tests/Cargo.toml --locked -- --include-ignored
+
+  native-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check native app and test code
+        run: cargo check --locked --tests
+      - name: Party and invite unit tests
+        run: |
+          cargo test --locked jam::
+          cargo test --locked deeplink::

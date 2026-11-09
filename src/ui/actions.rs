@@ -11,9 +11,9 @@ use super::{Action, App, Dialog, LibTab, NpTab, Page, jam, transfer};
 
 impl App {
     pub(super) fn apply(&mut self, a: Action) {
-        // In someone else's jam, playback changes become requests to the host.
-        let a = if self.jam.guest() {
-            match jam::guest_action(self, a) {
+        // Hosts and guests both send party controls to the authoritative server.
+        let a = if self.jam.active() {
+            match jam::party_action(self, a) {
                 Some(a) => a,
                 None => return,
             }

@@ -183,6 +183,11 @@ fn field_label(ui: &mut Ui, label: &str) {
 
 /// A labelled text box on a glass fill, like the jam and transfer pages' inputs.
 pub(super) fn text_field(ui: &mut Ui, label: &str, text: &mut String, multiline: bool, hint: &str) -> egui::Response {
+    text_field_limited(ui, label, text, multiline, hint, usize::MAX)
+}
+
+/// The same app-wide field, with a length limit for network-bound values.
+pub(super) fn text_field_limited(ui: &mut Ui, label: &str, text: &mut String, multiline: bool, hint: &str, limit: usize) -> egui::Response {
     use egui::{Sense, vec2};
     if !label.is_empty() {
         field_label(ui, label);
@@ -194,7 +199,7 @@ pub(super) fn text_field(ui: &mut Ui, label: &str, text: &mut String, multiline:
     let edit = if multiline { egui::TextEdit::multiline(text).desired_rows(4) } else { egui::TextEdit::singleline(text).align(egui::Align2::LEFT_CENTER) };
     let resp = ui.put(
         inner,
-        edit.hint_text(egui::RichText::new(hint).color(theme::text_faint())).font(theme::regular(14.0)).frame(egui::Frame::NONE).desired_width(inner.width()),
+        edit.hint_text(egui::RichText::new(hint).color(theme::text_faint())).font(theme::regular(14.0)).frame(egui::Frame::NONE).desired_width(inner.width()).char_limit(limit),
     );
     let focus = theme::anim_bool(ui.ctx(), resp.id.with("focus"), resp.has_focus(), 0.15);
     ui.painter().set(bg, egui::Shape::Vec(vec![

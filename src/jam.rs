@@ -1,139 +1,67 @@
-//! Listen together ("Jam"): a room on a small relay server (`server/`) that keeps
-//! everyone on the same song at the same moment.
-//!
-//! No audio goes through the server: each member streams the song from YouTube like
-//! any other. The host's app is the authority: it sends the queue and play state, and
-//! guests follow it. Guests' requests (add a song, and pause/skip/seek when the host
-//! allows it) go to the host, which applies them and sends the new state.
-//!
-//! The socket lives on the backend's tokio runtime; the UI talks to it through
-//! channels and is woken when something arrives.
+//! Official BitChord Listen Together client (REST membership + authenticated WebSocket).
+//! The server, not a desktop host, owns playback. Audio never passes through it.
+//! See the upstream `backend/README.md` for the protocol shared with Android.
 
-use std::collections::HashMap;
+#[path = "jam/protocol.rs"]
+pub mod protocol;
+
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
-use crate::model::Track;
+pub use protocol::{Clock, Frame, Identity, Membership, normalize_code, normalize_server};
+pub const DEFAULT_SERVER: &str = "https://api.bitchord.kushagrasingh.in";
 
-/// The relay. `YTM_JAM_SERVER` overrides it (e.g. `ws://127.0.0.1:8787` for `wrangler dev`).
-const SERVER: &str = "wss://ytm-rs-jam.grapedjuice.workers.dev";
-
-/// Room codes: no 0/O, 1/I/L, so they survive being read out loud.
-pub const ALPHABET: &str = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-pub const CODE_LEN: usize = 6;
-
-/// Link that opens the app (through the website) and joins the room.
-pub fn share_link(code: &str) -> String {
-    format!("https://grapedjuice.github.io/ytm-rs/jam/?c={code}")
+fn http_client() -> Result<reqwest::Client, String> {
+    crate::proxy::apply(reqwest::Client::builder())
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|_| "Couldn't initialize the party connection.".to_owned())
 }
 
-/// A fresh random room code.
-pub fn new_code() -> String {
-    use std::hash::{BuildHasher, Hasher};
-    // RandomState is seeded randomly per process; mix in the time for each call.
-    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u128(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos());
-    let mut n = h.finish();
-    let chars = ALPHABET.as_bytes();
-    (0..CODE_LEN)
-        .map(|_| {
-            let c = chars[(n % chars.len() as u64) as usize] as char;
-            n /= chars.len() as u64;
-            c
-        })
-        .collect()
-}
-
-/// `code` cleaned up (case, spaces, dashes) if it's a valid room code.
-pub fn normalize_code(code: &str) -> Option<String> {
-    let c: String = code.chars().filter(|c| !c.is_whitespace() && *c != '-').collect::<String>().to_ascii_uppercase();
-    (c.len() == CODE_LEN && c.chars().all(|ch| ALPHABET.contains(ch))).then_some(c)
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct Member {
-    pub id: String,
-    pub name: String,
-}
-
-/// The host's queue and playback, as sent to guests.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct RoomState {
-    pub queue: Vec<Track>,
-    pub index: usize,
-    /// Who added which song (by video ID), for songs guests added.
-    #[serde(default)]
-    pub by: HashMap<String, String>,
-    /// Which member added which song (video ID → member ID), for the per-guest cap.
-    #[serde(default)]
-    pub owner: HashMap<String, String>,
-    pub vid: String,
-    /// Position in ms at `ts`.
-    pub pos: u64,
-    pub playing: bool,
-}
-
-/// Where playback is, without the queue (the host's periodic heartbeat).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Tick {
-    pub vid: String,
-    pub pos: u64,
-    pub playing: bool,
-}
-
-impl Tick {
-    /// Position now, given when (locally) it was at `pos`.
-    pub fn position_at(&self, at: Instant) -> Duration {
-        let pos = Duration::from_millis(self.pos);
-        if self.playing { pos + at.elapsed() } else { pos }
+/// Preview does not allocate a membership or send account details.
+pub async fn preview(server: &str, code: &str) -> Result<protocol::Preview, String> {
+    let code = normalize_code(code).ok_or_else(|| "Enter a six-character party code.".to_owned())?;
+    let response = http_client()?.get(format!("{server}/api/parties/{code}/preview")).send().await.map_err(|_| "Couldn't reach the party server.".to_owned())?;
+    if !response.status().is_success() {
+        return Err(protocol::error_message("", response.status().as_u16()).to_owned());
     }
-}
-
-/// What a guest asks the host to do.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "k", rename_all = "lowercase")]
-pub enum Cmd {
-    Add { track: Track },
-    /// Play next.
-    Next { track: Track },
-    Toggle,
-    Skip,
-    Prev,
-    Seek { pos: u64 },
-    Jump { index: usize },
-}
-
-impl Cmd {
-    /// Only allowed while the host lets everyone control playback.
-    pub fn is_control(&self) -> bool {
-        !matches!(self, Cmd::Add { .. } | Cmd::Next { .. })
+    let preview: protocol::Preview = response.json().await.map_err(|_| "The server returned an invalid party preview.".to_owned())?;
+    if preview.code != code {
+        return Err("The server returned a different party code.".into());
     }
+    Ok(preview)
 }
 
-#[derive(Debug)]
+pub async fn probe(server: &str) -> Result<u64, String> {
+    let started = Instant::now();
+    let response = http_client()?.get(format!("{server}/healthz")).send().await.map_err(|_| "Party server is offline".to_owned())?;
+    if !response.status().is_success() {
+        return Err("Party server is offline".into());
+    }
+    let body: Value = response.json().await.map_err(|_| "Not a BitChord party server".to_owned())?;
+    if body["ok"] != true {
+        return Err("Not a BitChord party server".into());
+    }
+    Ok(started.elapsed().as_millis() as u64)
+}
+
+pub fn share_link(server: &str, code: &str) -> String {
+    let origin = if server == DEFAULT_SERVER { "https://bitchord.kushagrasingh.in" } else { server };
+    format!("{origin}/invite/{code}")
+}
+
 pub enum Event {
-    /// Joined (or rejoined after a dropped connection).
-    Welcome { you: String, host: String, control: bool, queue: bool, members: Vec<Member> },
-    Members { host: String, members: Vec<Member> },
-    /// What guests may do: control playback, add songs.
-    Control { on: bool, queue: bool },
-    /// The host's state; `Instant` is when (locally) playback was at `state.pos`.
-    State(RoomState, Instant),
-    Tick(Tick, Instant),
-    /// For the host: a guest's request.
-    Req { from: String, name: String, cmd: Cmd },
-    /// A request the server turned down (`denied`, `rate`), the room keeps going.
-    Notice(String),
-    /// The connection is gone for good: a reason to show.
-    Closed(String),
+    Joined(Membership),
+    Frame(Frame),
     Reconnecting,
+    Closed(String),
 }
 
 enum Out {
@@ -142,54 +70,39 @@ enum Out {
 }
 
 pub struct Jam {
-    pub code: String,
     out: mpsc::UnboundedSender<Out>,
     events: Receiver<Event>,
+    pub clock: Arc<Clock>,
 }
 
 impl Jam {
-    /// Connect to room `code`: `create` starts it (we're the host), otherwise join.
-    pub fn start(backend: &crate::backend::Backend, code: String, create: bool, name: String) -> Jam {
-        let (out_tx, out_rx) = mpsc::unbounded_channel();
-        let (ev_tx, ev_rx) = unbounded();
+    /// `code == None` creates a new party; codes are allocated by the official server.
+    pub fn start(backend: &crate::backend::Backend, server: String, code: Option<String>, identity: Identity) -> Self {
+        Self::start_with_capacity(backend, server, code, identity, 5)
+    }
+
+    pub fn start_with_capacity(backend: &crate::backend::Backend, server: String, code: Option<String>, identity: Identity, max_members: u8) -> Self {
+        let (out, rx) = mpsc::unbounded_channel();
+        let (events, ev_rx) = unbounded();
+        let clock = Arc::new(Clock::default());
         let wake = backend.clone();
-        let task = Conn { code: code.clone(), create, name, events: ev_tx, wake: Arc::new(move || wake.wake()), offset: Arc::new(AtomicI64::new(0)) };
-        backend.spawn(task.run(out_rx));
-        Jam { code, out: out_tx, events: ev_rx }
+        let conn = Conn { server, events, clock: clock.clone(), wake: Arc::new(move || wake.wake()) };
+        backend.spawn(conn.run(code, identity, max_members.clamp(2, 10), rx));
+        Self { out, events: ev_rx, clock }
     }
 
     pub fn try_recv(&self) -> Option<Event> {
         self.events.try_recv().ok()
     }
 
-    fn send(&self, v: serde_json::Value) {
-        let _ = self.out.send(Out::Text(v.to_string()));
+    pub fn send(&self, frame: Value) {
+        let _ = self.out.send(Out::Text(frame.to_string()));
     }
 
-    pub fn send_state(&self, s: &RoomState) {
-        let mut v = serde_json::to_value(s).unwrap_or_default();
-        v["t"] = "state".into();
-        self.send(v);
-    }
-
-    pub fn send_tick(&self, t: &Tick) {
-        let mut v = serde_json::to_value(t).unwrap_or_default();
-        v["t"] = "tick".into();
-        self.send(v);
-    }
-
-    /// Host: let guests control playback (`on`) and add songs (`queue`).
-    pub fn set_control(&self, on: bool, queue: bool) {
-        self.send(serde_json::json!({ "t": "control", "on": on, "queue": queue }));
-    }
-
-    pub fn request(&self, cmd: Cmd) {
-        self.send(serde_json::json!({ "t": "req", "cmd": cmd }));
-    }
-
-    /// Host: close the room for everyone.
-    pub fn end(&self) {
-        self.send(serde_json::json!({ "t": "end" }));
+    pub fn control(&self, action: &str, mut body: Value) {
+        body["type"] = "control".into();
+        body["action"] = action.into();
+        self.send(body);
     }
 
     pub fn leave(&self) {
@@ -203,276 +116,210 @@ impl Drop for Jam {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "t", rename_all = "lowercase")]
-enum In {
-    Welcome {
-        you: String,
-        host: String,
-        control: bool,
-        #[serde(default = "yes")]
-        queue: bool,
-        members: Vec<Member>,
-        state: Option<Stamped<RoomState>>,
-        tick: Option<Stamped<Tick>>,
-        now: i64,
-    },
-    Members { host: String, members: Vec<Member> },
-    Control {
-        on: bool,
-        #[serde(default = "yes")]
-        queue: bool,
-    },
-    State(Stamped<RoomState>),
-    Tick(Stamped<Tick>),
-    Req { from: String, name: String, cmd: Cmd },
-    Pong { c: i64, s: i64 },
-    Error { code: String, msg: Option<String> },
-    Ended,
-}
-
-#[derive(Deserialize)]
-struct Stamped<T> {
-    #[serde(flatten)]
-    v: T,
-    ts: i64,
-}
-
-fn yes() -> bool {
-    true
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
-}
-
-/// Why a connection ended.
-enum End {
-    /// Left, or the room ended: nothing to show or retry.
-    Done(Option<String>),
-    /// The server refused us (bad code, full...): show it, don't retry.
-    Refused(String),
-    /// The network dropped: try again.
-    Dropped(String),
-}
-
 struct Conn {
-    code: String,
-    create: bool,
-    name: String,
+    server: String,
     events: Sender<Event>,
+    clock: Arc<Clock>,
     wake: Arc<dyn Fn() + Send + Sync>,
-    /// Server clock minus ours, in ms.
-    offset: Arc<AtomicI64>,
+}
+
+enum End {
+    Left,
+    Refused(String),
+    Dropped,
 }
 
 impl Conn {
-    fn emit(&self, e: Event) {
-        let _ = self.events.send(e);
+    fn emit(&self, event: Event) {
+        let _ = self.events.send(event);
         (self.wake)();
     }
 
-    /// When (locally) the server time `ts` was.
-    fn local_instant(&self, ts: i64) -> Instant {
-        let age = (now_ms() + self.offset.load(Ordering::Relaxed) - ts).clamp(0, 60_000);
-        Instant::now() - Duration::from_millis(age as u64)
+    async fn membership(&self, http: &reqwest::Client, code: Option<&str>, identity: &Identity, max_members: u8) -> Result<Membership, String> {
+        let path = match code {
+            Some(code) => format!("/api/parties/{code}/join"),
+            None => "/api/parties".to_owned(),
+        };
+        // Never forward a Google cookie or credential to a party server.
+        let mut body = serde_json::to_value(identity).map_err(|_| "Invalid party identity.".to_owned())?;
+        if code.is_none() {
+            body["maxMembers"] = max_members.into();
+        }
+        let response =
+            http.post(format!("{}{path}", self.server)).json(&body).send().await.map_err(|_| "Couldn't reach the party server. Check the address and try again.".to_owned())?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let error = response.json::<Value>().await.unwrap_or_default();
+            return Err(protocol::error_message(error["error"].as_str().unwrap_or(""), status).to_owned());
+        }
+        response.json().await.map_err(|_| "The party server returned an invalid membership.".to_owned())
     }
 
-    async fn run(mut self, mut out: mpsc::UnboundedReceiver<Out>) {
-        let mut retries = 0;
-        loop {
-            let started = Instant::now();
-            let end = self.session(&mut out).await;
-            // Drops spread over a long jam shouldn't add up to giving up.
-            if started.elapsed() > Duration::from_secs(120) {
-                retries = 0;
+    async fn run(self, code: Option<String>, identity: Identity, max_members: u8, mut out: mpsc::UnboundedReceiver<Out>) {
+        let http = match crate::proxy::apply(reqwest::Client::builder()).redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(20)).build() {
+            Ok(http) => http,
+            Err(_) => {
+                self.emit(Event::Closed("Couldn't initialize the party connection.".into()));
+                return;
             }
-            match end {
-                End::Done(msg) => {
-                    if let Some(m) = msg {
-                        self.emit(Event::Closed(m));
-                    }
-                    return;
+        };
+        let membership = match self.membership(&http, code.as_deref(), &identity, max_members).await {
+            Ok(membership) if normalize_code(&membership.code).as_deref() == Some(membership.code.as_str()) && !membership.token.is_empty() => membership,
+            Ok(_) => {
+                self.emit(Event::Closed("The party server returned an invalid membership.".into()));
+                return;
+            }
+            Err(message) => {
+                self.emit(Event::Closed(message));
+                return;
+            }
+        };
+        let mut leaving = out.is_closed();
+        // Cancellation during the REST call must release the slot too.
+        while let Ok(message) = out.try_recv() {
+            leaving |= matches!(message, Out::Leave);
+        }
+        if !leaving {
+            self.clock.seed(if membership.server_ms > 0 { membership.server_ms } else { membership.party.server_ms });
+            self.emit(Event::Joined(membership.clone()));
+            let mut retries = 0;
+            loop {
+                let started = Instant::now();
+                let end = self.session(&membership, &mut out).await;
+                if started.elapsed() > Duration::from_secs(120) {
+                    retries = 0;
                 }
-                End::Refused(msg) => {
-                    self.emit(Event::Closed(msg));
-                    return;
-                }
-                End::Dropped(e) => {
-                    log::warn!("jam: connection dropped: {e}");
-                    // The room survives a few minutes without anyone in it; rejoin it.
-                    self.create = false;
-                    retries += 1;
-                    if retries > 6 {
-                        self.emit(Event::Closed("Lost the connection to the jam".into()));
-                        return;
+                match end {
+                    End::Left => break,
+                    End::Refused(message) => {
+                        self.emit(Event::Closed(message));
+                        break;
                     }
-                    self.emit(Event::Reconnecting);
-                    tokio::time::sleep(Duration::from_secs(2 * retries)).await;
-                    // Leaving while reconnecting.
-                    if matches!(out.try_recv(), Ok(Out::Leave)) || out.is_closed() {
-                        return;
+                    End::Dropped => {
+                        retries += 1;
+                        if retries > 6 {
+                            self.emit(Event::Closed("Lost the connection to the party. Join again to reconnect.".into()));
+                            break;
+                        }
+                        // Do not replay controls queued while disconnected: a delayed seek or
+                        // skip could overwrite changes another listener made in the meantime.
+                        self.emit(Event::Reconnecting);
+                        let delay = tokio::time::sleep(Duration::from_secs(retries.min(5)));
+                        tokio::pin!(delay);
+                        let leave = loop {
+                            tokio::select! {
+                                _ = &mut delay => break false,
+                                message = out.recv() => {
+                                    if matches!(message, Some(Out::Leave) | None) { break true; }
+                                }
+                            }
+                        };
+                        if leave {
+                            break;
+                        }
                     }
                 }
             }
         }
+        // A host leaves just like any other member; the server reassigns the role.
+        // Tokens stay in memory, never in UI persistence, URLs, or logs.
+        let _ = http.post(format!("{}/api/parties/{}/leave", self.server, membership.code)).bearer_auth(&membership.token).send().await;
     }
 
-    async fn session(&mut self, out: &mut mpsc::UnboundedReceiver<Out>) -> End {
-        let base = std::env::var("YTM_JAM_SERVER").unwrap_or_else(|_| SERVER.to_owned());
-        let name: String = url_encode(&self.name);
-        let url = format!("{}/jam/{}?create={}&name={name}&v=1", base.trim_end_matches('/'), self.code, self.create as u8);
-        // Through the proxy setting, like everything else.
+    async fn session(&self, membership: &Membership, out: &mut mpsc::UnboundedReceiver<Out>) -> End {
+        while let Ok(message) = out.try_recv() {
+            if matches!(message, Out::Leave) {
+                return End::Left;
+            }
+        }
+        let base = self.server.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
+        let url = format!("{base}/ws/parties/{}", membership.code);
         let connect = async {
             let u = url::Url::parse(&url)?;
-            let host = u.host_str().unwrap_or_default().to_owned();
-            let port = u.port_or_known_default().unwrap_or(443);
-            let tcp = crate::proxy::connect(&host, port).await?;
-            anyhow::Ok(tokio_tungstenite::client_async_tls(url, tcp).await?)
+            let tcp = crate::proxy::connect(u.host_str().unwrap_or_default(), u.port_or_known_default().unwrap_or(443)).await?;
+            let mut request = url.as_str().into_client_request()?;
+            let mut authorization = format!("Bearer {}", membership.token).parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()?;
+            authorization.set_sensitive(true);
+            request.headers_mut().insert("Authorization", authorization);
+            anyhow::Ok(tokio_tungstenite::client_async_tls(request, tcp).await?)
         };
         let ws = match tokio::time::timeout(Duration::from_secs(10), connect).await {
             Ok(Ok((ws, _))) => ws,
-            Ok(Err(e)) => return End::Dropped(e.to_string()),
-            Err(_) => return End::Dropped("timed out".into()),
+            Ok(Err(error)) => {
+                if let Some(tokio_tungstenite::tungstenite::Error::Http(response)) = error.downcast_ref::<tokio_tungstenite::tungstenite::Error>() {
+                    if response.status().is_client_error() {
+                        return End::Refused(protocol::error_message("", response.status().as_u16()).into());
+                    }
+                }
+                return End::Dropped;
+            }
+            Err(_) => return End::Dropped,
         };
         let (mut tx, mut rx) = ws.split();
-        let mut keepalive = tokio::time::interval(Duration::from_secs(25));
-        keepalive.tick().await;
-        // Clock sync: a few pings right after joining; the quickest round trip wins.
-        let mut sync = tokio::time::interval(Duration::from_millis(200));
-        let mut pings_left = 0u32;
-        let mut best_rtt = i64::MAX;
+        let mut ping = tokio::time::interval(Duration::from_millis(300));
+        let mut ping_count = 0;
         let mut last_rx = Instant::now();
+        let mut welcomed = false;
         loop {
             tokio::select! {
-                msg = out.recv() => match msg {
-                    Some(Out::Text(t)) => {
-                        if let Err(e) = tx.send(Message::text(t)).await {
-                            return End::Dropped(e.to_string());
-                        }
+                message = out.recv() => match message {
+                    Some(Out::Text(text)) if welcomed => {
+                        if tx.send(Message::text(text)).await.is_err() { return End::Dropped; }
                     }
+                    Some(Out::Text(_)) => {},
                     Some(Out::Leave) | None => {
-                        let _ = tx.send(Message::text(r#"{"t":"bye"}"#)).await;
                         let _ = tx.close().await;
-                        return End::Done(None);
+                        return End::Left;
                     }
                 },
-                _ = keepalive.tick() => {
-                    // The server answers every ping; silence means the connection is dead.
-                    if last_rx.elapsed() > Duration::from_secs(60) {
-                        return End::Dropped("no reply from the server".into());
+                _ = ping.tick() => {
+                    if last_rx.elapsed() > Duration::from_secs(45) { return End::Dropped; }
+                    let frame = json!({"type": "ping", "clientMs": self.clock.local_ms()});
+                    if tx.send(Message::text(frame.to_string())).await.is_err() { return End::Dropped; }
+                    ping_count += 1;
+                    if ping_count == 4 {
+                        ping = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(10), Duration::from_secs(10));
                     }
-                    if let Err(e) = tx.send(Message::text("ping")).await {
-                        return End::Dropped(e.to_string());
-                    }
-                }
-                _ = sync.tick(), if pings_left > 0 => {
-                    pings_left -= 1;
-                    let _ = tx.send(Message::text(format!(r#"{{"t":"ping","c":{}}}"#, now_ms()))).await;
-                }
-                msg = rx.next() => {
-                    last_rx = Instant::now();
-                    let text = match msg {
-                        Some(Ok(Message::Text(t))) => t,
-                        Some(Ok(Message::Close(_))) | None => return End::Dropped("closed by server".into()),
+                },
+                message = rx.next() => {
+                    let text = match message {
+                        Some(Ok(Message::Text(text))) => text,
+                        Some(Ok(Message::Ping(data))) => {
+                            if tx.send(Message::Pong(data)).await.is_err() { return End::Dropped; }
+                            continue;
+                        }
+                        Some(Ok(Message::Close(_))) | None => return End::Dropped,
                         Some(Ok(_)) => continue,
-                        Some(Err(e)) => return End::Dropped(e.to_string()),
+                        Some(Err(_)) => return End::Dropped,
                     };
-                    if text.as_str() == "pong" {
-                        continue;
-                    }
-                    let Ok(m) = serde_json::from_str::<In>(&text) else {
-                        log::warn!("jam: unreadable message {text}");
+                    last_rx = Instant::now();
+                    let Ok(frame) = serde_json::from_str::<Frame>(&text) else {
+                        // Don't log raw frames: welcomes contain membership information.
+                        log::warn!("jam: ignored an invalid party frame");
                         continue;
                     };
-                    match m {
-                        In::Welcome { you, host, control, queue, members, state, tick, now } => {
-                            // A first guess until the pings answer.
-                            self.offset.store(now - now_ms(), Ordering::Relaxed);
-                            pings_left = 5;
-                            self.create = false;
-                            self.emit(Event::Welcome { you, host, control, queue, members });
-                            if let Some(s) = state {
-                                let at = self.local_instant(s.ts);
-                                self.emit(Event::State(s.v, at));
-                            }
-                            if let Some(t) = tick {
-                                let at = self.local_instant(t.ts);
-                                self.emit(Event::Tick(t.v, at));
-                            }
+                    match &frame {
+                        Frame::Welcome { server_ms, .. } => {
+                            welcomed = true;
+                            self.clock.seed(*server_ms);
                         }
-                        In::Members { host, members } => self.emit(Event::Members { host, members }),
-                        In::Control { on, queue } => self.emit(Event::Control { on, queue }),
-                        In::State(s) => {
-                            let at = self.local_instant(s.ts);
-                            self.emit(Event::State(s.v, at));
+                        Frame::Pong { client_ms, server_ms } => {
+                            self.clock.sample(*client_ms, *server_ms);
+                            continue;
                         }
-                        In::Tick(t) => {
-                            let at = self.local_instant(t.ts);
-                            self.emit(Event::Tick(t.v, at));
-                        }
-                        In::Req { from, name, cmd } => self.emit(Event::Req { from, name, cmd }),
-                        In::Pong { c, s } => {
-                            let rtt = now_ms() - c;
-                            if rtt >= 0 && rtt < best_rtt {
-                                best_rtt = rtt;
-                                self.offset.store(s - (c + rtt / 2), Ordering::Relaxed);
+                        Frame::Bye { reason } => return End::Refused(if reason == "kicked" {
+                            "The host removed you from the party.".into()
+                        } else { "You left the party.".into() }),
+                        Frame::Error { error } => {
+                            if matches!(error.as_str(), "unauthorized" | "not_found" | "invalid_token") {
+                                return End::Refused(protocol::error_message(error, 401).into());
                             }
                         }
-                        In::Error { code, msg } => {
-                            let text = match code.as_str() {
-                                "not_found" => "No jam with that code. Check it and try again".to_owned(),
-                                "taken" => "That jam code is taken, try again".to_owned(),
-                                "full" => "That jam is full".to_owned(),
-                                "denied" => msg.clone().unwrap_or_else(|| "Only the host can do that".to_owned()),
-                                "rate" => "Slow down a little".to_owned(),
-                                _ => msg.unwrap_or(code.clone()),
-                            };
-                            if matches!(code.as_str(), "denied" | "rate") {
-                                self.emit(Event::Notice(text));
-                            } else {
-                                return End::Refused(text);
-                            }
-                        }
-                        In::Ended => return End::Done(Some("The host ended the jam".into())),
+                        _ => {}
                     }
+                    self.emit(Event::Frame(frame));
                 }
             }
         }
-    }
-}
-
-fn url_encode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn codes() {
-        for _ in 0..50 {
-            let c = new_code();
-            assert_eq!(normalize_code(&c).as_deref(), Some(c.as_str()));
-        }
-        assert_eq!(normalize_code(" abc-234 ").as_deref(), Some("ABC234"));
-        assert_eq!(normalize_code("ABC23O"), None);
-        assert_eq!(normalize_code("ABC2345"), None);
-    }
-
-    #[test]
-    fn parses_server_messages() {
-        let m: In = serde_json::from_str(r#"{"t":"tick","vid":"x","pos":1200,"playing":true,"ts":5}"#).unwrap();
-        assert!(matches!(m, In::Tick(Stamped { ts: 5, .. })));
-        let m: In = serde_json::from_str(r#"{"t":"req","from":"a","name":"Sam","cmd":{"k":"seek","pos":3000}}"#).unwrap();
-        assert!(matches!(m, In::Req { cmd: Cmd::Seek { pos: 3000 }, .. }));
-        let m: In = serde_json::from_str(r#"{"t":"welcome","you":"a","host":"a","control":false,"members":[{"id":"a","name":"Sam"}],"state":null,"tick":null,"now":1}"#).unwrap();
-        assert!(matches!(m, In::Welcome { .. }));
     }
 }

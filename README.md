@@ -59,7 +59,7 @@
 **Accounts and library**
 - **Google sign-in** — unlock your YouTube Music feed, likes, playlists, history and recommendations.
 - **Library and uploads** — access saved music and uploaded tracks where available.
-- **Listen Together / jams** — start or join a shared listening session.
+- **Listen Together / jams** — start or join a shared listening session using the official BitChord party protocol, including mobile participants on the same server. See [setup and testing](docs/listen-together.md).
 - **Spotify transfer** — bring playlists and liked music over from Spotify.
 
 ## Installation

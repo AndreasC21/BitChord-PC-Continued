@@ -206,6 +206,11 @@ pub fn icon_button(ui: &mut Ui, glyph: char, size: f32, name: &str, active: bool
 
 /// Rounded pill button. `primary` = white with dark text (YouTube Music's Play button).
 pub fn pill(ui: &mut Ui, label: &str, glyph: Option<char>, primary: bool) -> Response {
+    pill_tinted(ui, label, glyph, primary, None)
+}
+
+/// Standard pill geometry/interaction with an optional semantic foreground colour.
+pub fn pill_tinted(ui: &mut Ui, label: &str, glyph: Option<char>, primary: bool, foreground: Option<Color32>) -> Response {
     // Laid out once; the colour is given when it's painted.
     let text = ui.painter().layout_no_wrap(label.to_owned(), theme::semibold(14.0), Color32::PLACEHOLDER);
     let icon_w = if glyph.is_some() { 24.0 } else { 0.0 };
@@ -217,6 +222,7 @@ pub fn pill(ui: &mut Ui, label: &str, glyph: Option<char>, primary: bool) -> Res
     } else {
         (theme::glass(0.10 + 0.08 * h), theme::text())
     };
+    let fg = foreground.unwrap_or(fg);
     let r = rect.shrink(if resp.is_pointer_button_down_on() { 1.0 } else { 0.0 });
     ui.painter().rect_filled(r, 19.0, fill);
     let mut x = r.left() + 18.0;

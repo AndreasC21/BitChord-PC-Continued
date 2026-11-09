@@ -1,4 +1,4 @@
-//! Jam deep links: `ytm-rs://jam/CODE` and `https://grapedjuice.github.io/ytm-rs/jam/?c=CODE`.
+//! Official BitChord invites plus legacy desktop deep links.
 //!
 //! Clicking a link launches a new process with the URL as its argument. If another
 //! instance is already running, the new one hands the code over a named pipe and
@@ -22,6 +22,17 @@ pub const RELAUNCH_FLAG: &str = "--relaunch";
 /// `ytm-rs://jam/CODE[/]` (any case) or the https share link with `?c=CODE`.
 pub fn parse(arg: &str) -> Option<String> {
     let arg = arg.trim().trim_matches('"');
+    if let Ok(url) = url::Url::parse(arg) {
+        let official = url.scheme() == "https" && url.host_str() == Some("bitchord.kushagrasingh.in") && url.port().is_none();
+        let custom = url.scheme() == "bitchord" && url.host_str() == Some("party");
+        if official || custom {
+            if !url.username().is_empty() || url.password().is_some() { return None; }
+            // Server parameters must be handled explicitly by the user, never silently
+            // used as an endpoint for profile data. The lobby confirms the server.
+            let candidate = if official { url.path().strip_prefix("/invite/")? } else { url.path().strip_prefix('/')? };
+            return (candidate.len() == 6 && candidate.chars().all(|c| c.is_ascii_alphanumeric())).then(|| normalize(candidate)).flatten();
+        }
+    }
     let (scheme, rest) = arg.split_once("://")?;
     let rest = rest.split('#').next().unwrap_or("");
     if scheme.eq_ignore_ascii_case("ytm-rs") {
@@ -310,7 +321,6 @@ mod tests {
             "ytm-rs://jam/",
             "ytm-rs://jam/ABC23",      // too short
             "ytm-rs://jam/ABC2345",    // too long
-            "ytm-rs://jam/ABC0I1",     // 0, I, 1 are not in the alphabet
             "ytm-rs://jam/ABC234/xyz", // extra path
             "ytm-rs://room/ABC234",
             "https://example.com/ytm-rs/jam/?c=ABC234",
@@ -328,6 +338,15 @@ mod tests {
         push("XYZ789".into());
         assert_eq!(take(), ["ABC234", "XYZ789"]);
         assert!(take().is_empty());
+    }
+
+    #[test]
+    fn official_mobile_invites() {
+        assert_eq!(parse("https://bitchord.kushagrasingh.in/invite/ABC012").as_deref(), Some("ABC012"));
+        assert_eq!(parse("bitchord://party/abc012").as_deref(), Some("ABC012"));
+        for bad in ["https://example.com/invite/ABC012", "https://bitchord.kushagrasingh.in.evil.test/invite/ABC012", "https://bitchord.kushagrasingh.in/invite/ABC012/extra"] {
+            assert!(parse(bad).is_none(), "{bad}");
+        }
     }
 
     #[cfg(windows)]

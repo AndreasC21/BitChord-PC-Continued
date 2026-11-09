@@ -29,7 +29,7 @@ impl App {
         }
         while let Ok(ev) = self.ch.audio_rx.try_recv() {
             match ev {
-                AudioEvent::Finished { generation } if generation == self.generation && self.jam.guest() => {}
+                AudioEvent::Finished { generation } if generation == self.generation && self.jam.active() => super::jam::finished(self),
                 AudioEvent::Finished { generation } if generation == self.generation => {
                     if self.queue.repeat == Repeat::One {
                         self.play_current();
@@ -39,7 +39,7 @@ impl App {
                 }
                 AudioEvent::Finished { .. } => {}
                 // Crossfade into the next song; repeat-one and the end of the queue wait for the end.
-                AudioEvent::Ending { generation } if generation == self.generation && !self.jam.guest() && self.queue.repeat != Repeat::One => {
+                AudioEvent::Ending { generation } if generation == self.generation && !self.jam.active() && self.queue.repeat != Repeat::One => {
                     // Automix: the next song eases in under this one, which keeps the
                     // player until the blend has given the next song the louder half
                     // (see `MixFrom`).
@@ -85,7 +85,8 @@ impl App {
         }
         while let Ok(ev) = self.ch.media_rx.try_recv() {
             match ev {
-                MediaControlEvent::Play | MediaControlEvent::Pause if self.jam.guest() => self.toggle(),
+                MediaControlEvent::Play if self.jam.active() => super::jam::set_playing(self, true),
+                MediaControlEvent::Pause | MediaControlEvent::Stop if self.jam.active() => super::jam::set_playing(self, false),
                 MediaControlEvent::Play if self.resume_at.is_some() => self.toggle(),
                 MediaControlEvent::Play => self.audio.send(AudioCmd::Resume),
                 MediaControlEvent::Pause | MediaControlEvent::Stop => self.audio.send(AudioCmd::Pause),
@@ -363,6 +364,8 @@ impl App {
             }
             Resp::Radio { seed, tracks } => {
                 self.radio_pending = false;
+                // A local autoplay request may finish after entering a party.
+                if self.jam.active() { return; }
                 let was_at_end = self.queue.add_radio(&seed, tracks);
                 if was_at_end && self.queue.index.is_some() && !self.buffering && !self.playing() {
                     // The track ended while radio was loading: continue now.
@@ -582,6 +585,7 @@ impl App {
     fn on_play_error(&mut self, generation: u64, msg: String) {
         if generation == self.generation {
             self.buffering = false;
+            if self.jam.active() { super::jam::playback_failed(self); }
             if self.mix_from.take().is_some() {
                 self.pending_mix = None;
                 self.audio.send(AudioCmd::Stop);
@@ -599,7 +603,7 @@ impl App {
             if let Some(why) = account_block(&reason, self.logged_in) {
                 self.skip_streak = 0;
                 self.toast(why.replace("{title}", &title));
-            } else if has_next && self.skip_streak < MAX_SKIPS {
+            } else if has_next && self.skip_streak < MAX_SKIPS && !self.jam.active() {
                 // Don't stall the queue on one unplayable song.
                 self.skip_streak += 1;
                 self.toast(format!("Skipped \"{title}\": {reason}"));
@@ -614,6 +618,8 @@ impl App {
     /// Signed in or out: what belonged to the last account goes, and the new one's home,
     /// library and likes load.
     fn on_logged_in(&mut self, v: bool, now: f64) {
+        // A party's display identity belongs to the account that joined it.
+        super::jam::leave(self);
         self.logged_in = v;
         self.channels = None;
         self.channels_asked = None;
